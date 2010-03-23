@@ -1,0 +1,8 @@
+*~
+pkg/
+src/
+rtorrent-0.8.6/
+libtorrent-0.12.6/
+*.pkg.tar.gz
+*.src.tar.gz
+*.tar.gz

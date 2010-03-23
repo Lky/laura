@@ -1,0 +1,1652 @@
+diff --git a/src/download/download_constructor.cc b/src/download/download_constructor.cc
+index f37f848..86e5351 100644
+--- a/src/download/download_constructor.cc
++++ b/src/download/download_constructor.cc
+@@ -81,7 +81,10 @@ struct download_constructor_encoding_match :
+ };
+ 
+ void
+-DownloadConstructor::initialize(const Object& b) {
++DownloadConstructor::initialize(Object& b) {
++  if (!b.has_key_map("info") && b.has_key_string("magnet-uri"))
++    parse_magnet_uri(b, b.get_key_string("magnet-uri"));
++
+   if (b.has_key_string("encoding"))
+     m_defaultEncoding = b.get_key_string("encoding");
+ 
+@@ -136,10 +139,24 @@ DownloadConstructor::parse_info(const Object& b) {
+   if (b.flags() & Object::flag_unordered)
+     throw input_error("Download has unordered info dictionary.");
+ 
+-  uint32_t chunkSize = b.get_key_value("piece length");
++  uint32_t chunkSize;
++
++  if (b.has_key_value("meta_download") && b.get_key_value("meta_download"))
++    m_download->info()->set_meta_download(true);
++
++  if (m_download->info()->is_meta_download()) {
++    if (b.get_key_string("pieces").length() != HashString::size_data)
++      throw input_error("Meta-download has invalid piece data.");
++
++    chunkSize = 1;
++    parse_single_file(b, chunkSize);
++
++  } else {
++    chunkSize = b.get_key_value("piece length");
+ 
+-  if (chunkSize <= (1 << 10) || chunkSize > (128 << 20))
+-    throw input_error("Torrent has an invalid \"piece length\".");
++    if (chunkSize <= (1 << 10) || chunkSize > (128 << 20))
++      throw input_error("Torrent has an invalid \"piece length\".");
++  }
+ 
+   if (b.has_key("length")) {
+     parse_single_file(b, chunkSize);
+@@ -148,11 +165,11 @@ DownloadConstructor::parse_info(const Object& b) {
+     parse_multi_files(b.get_key("files"), chunkSize);
+     fileList->set_root_dir("./" + m_download->info()->name());
+ 
+-  } else {
++  } else if (!m_download->info()->is_meta_download()) {
+     throw input_error("Torrent must have either length or files entry.");
+   }
+ 
+-  if (fileList->size_bytes() == 0)
++  if (fileList->size_bytes() == 0 && !m_download->info()->is_meta_download())
+     throw input_error("Torrent has zero length.");
+ 
+   // Set chunksize before adding files to make sure the index range is
+@@ -239,7 +256,7 @@ DownloadConstructor::parse_single_file(const Object& b, uint32_t chunkSize) {
+     throw input_error("Bad torrent file, \"name\" is an invalid path name.");
+ 
+   FileList* fileList = m_download->main()->file_list();
+-  fileList->initialize(b.get_key_value("length"), chunkSize);
++  fileList->initialize(chunkSize == 1 ? 1 : b.get_key_value("length"), chunkSize);
+   fileList->set_multi_file(false);
+ 
+   std::list<Path> pathList;
+@@ -343,4 +360,132 @@ DownloadConstructor::choose_path(std::list<Path>* pathList) {
+   return pathList->front();
+ }
+ 
++static const char*
++parse_base32_sha1(const char* pos, HashString& hash) {
++  HashString::iterator hashItr = hash.begin();
++
++  static const int base_shift = 8+8-5;
++  int shift = base_shift;
++  uint16_t decoded = 0;
++
++  while (*pos) {
++    char c = *pos++;
++    uint16_t value;
++
++    if (c >= 'A' && c <= 'Z')
++      value = c - 'A';
++    else if (c >= 'a' && c <= 'z')
++      value = c - 'a';
++    else if (c >= '2' && c <= '7')
++      value = 26 + c - '2';
++    else if (c == '&')
++      break;
++    else
++      return NULL;
++
++    decoded |= (value << shift);
++    if (shift <= 8) {
++      // Too many characters for a base32 SHA1.
++      if (hashItr == hash.end())
++        return NULL;
++
++      *hashItr++ = (decoded >> 8);
++      decoded <<= 8;
++      shift += 3;
++    } else {
++      shift -= 5;
++    }
++  }
++
++  return hashItr != hash.end() || shift != base_shift ? NULL : pos;
++}
++
++void
++DownloadConstructor::parse_magnet_uri(Object& b, const std::string& uri) {
++  if (std::strncmp(uri.c_str(), "magnet:?", 8))
++    throw input_error("Invalid magnet URI.");
++
++  const char* pos = uri.c_str() + 8;
++
++  Object trackers(Object::create_list());
++  HashString hash;
++  bool hashValid = false;
++
++  while (*pos) {
++    const char* tagStart = pos;
++    while (*pos != '=')
++      if (!*pos++)
++        break;
++
++    SimpleString tag(tagStart, pos - tagStart);
++    pos++;
++
++    // hash may be base32 encoded (optional in BEP 0009 and common practice)
++    if (tag == "xt") {
++      if (strncmp(pos, "urn:btih:", 9))
++        throw input_error("Invalid magnet URI.");
++
++      pos += 9;
++
++      const char* nextPos = parse_base32_sha1(pos, hash);
++      if (nextPos != NULL) {
++        pos = nextPos;
++        hashValid = true;
++        continue;
++      }
++    }
++
++    // everything else, including sometimes the hash, is url encoded.
++    std::string decoded;
++    while (*pos) {
++      char c = *pos++;
++      if (c == '%') {
++        if (sscanf(pos, "%02hhx", &c) != 1)
++          throw input_error("Invalid magnet URI.");
++
++        pos += 2;
++
++      } else if (c == '&') {
++        break;
++      }
++
++      decoded.push_back(c);
++    }
++
++    if (tag == "xt") {
++      // url-encoded hash as per magnet URN specs
++      if (decoded.length() == hash.size_data) {
++        hash = *HashString::cast_from(decoded);
++        hashValid = true;
++
++      // hex-encoded hash as per BEP 0009
++      } else if (decoded.length() == hash.size_data * 2) {
++        std::string::iterator hexItr = decoded.begin();
++        for (HashString::iterator itr = hash.begin(), last = hash.end(); itr != last; itr++, hexItr += 2)
++          *itr = (rak::hexchar_to_value(*hexItr) << 4) + rak::hexchar_to_value(*(hexItr + 1));
++        hashValid = true;
++
++      } else {
++        throw input_error("Invalid magnet URI.");
++      }
++    } else if (tag == "tr") {
++      trackers.insert_back(Object::create_list()).insert_back(decoded);
++    }
++    // could also handle "dn" = display name (torrent name), but we can't really use that
++  }
++
++  if (!hashValid)
++    throw input_error("Invalid magnet URI.");
++
++  Object& info = b.insert_key("info", Object::create_map());
++  info.insert_key("pieces", hash.str());
++  info.insert_key("name", rak::transform_hex(hash.str()) + ".meta");
++  info.insert_key("meta_download", (int64_t)1);
++
++  if (!trackers.as_list().empty()) {
++    b.insert_preserve_copy("announce", trackers.as_list().begin()->as_list().begin()->as_string());
++    b.insert_preserve_type("announce-list", trackers);
++  }
++}
++
+ }
+diff --git a/src/download/download_constructor.h b/src/download/download_constructor.h
+index 7192f90..8af520f 100644
+--- a/src/download/download_constructor.h
++++ b/src/download/download_constructor.h
+@@ -55,7 +55,7 @@ class DownloadConstructor {
+ public:
+   DownloadConstructor() : m_download(NULL), m_encodingList(NULL) {}
+ 
+-  void                initialize(const Object& b);
++  void                initialize(Object& b);
+ 
+   void                set_download(DownloadWrapper* d)         { m_download = d; }
+   void                set_encoding_list(const EncodingList* e) { m_encodingList = e; }
+@@ -64,6 +64,7 @@ private:
+   void                parse_name(const Object& b);
+   void                parse_tracker(const Object& b);
+   void                parse_info(const Object& b);
++  void                parse_magnet_uri(Object& b, const std::string& uri);
+ 
+   void                add_tracker_group(const Object& b);
+   void                add_tracker_single(const Object& b, int group);
+diff --git a/src/download/download_info.h b/src/download/download_info.h
+index 0a3c0e8..68fb178 100644
+--- a/src/download/download_info.h
++++ b/src/download/download_info.h
+@@ -76,6 +76,7 @@ public:
+     m_isCompact(true),
+     m_isAcceptingNewPeers(true),
+     m_isPrivate(false),
++    m_isMetaDownload(false),
+     m_pexEnabled(true),
+     m_pexActive(true),
+ 
+@@ -86,7 +87,8 @@ public:
+     m_uploadedBaseline(0),
+     m_completedBaseline(0),
+     m_sizePex(0),
+-    m_maxSizePex(8) {
++    m_maxSizePex(8),
++    m_metadataSize(0) {
+   }
+ 
+   const std::string&  name() const                                 { return m_name; }
+@@ -116,6 +118,9 @@ public:
+   bool                is_private() const                           { return m_isPrivate; }
+   void                set_private(bool p)                          { m_isPrivate = p; if (p) m_pexEnabled = false; }
+ 
++  bool                is_meta_download() const                     { return m_isMetaDownload; }
++  void                set_meta_download(bool m)                    { m_isMetaDownload = m; }
++
+   bool                is_pex_enabled() const                       { return m_pexEnabled; }
+   void                set_pex_enabled(bool enabled)                { m_pexEnabled = enabled && !m_isPrivate; }
+ 
+@@ -134,6 +139,9 @@ public:
+   uint64_t            completed_adjusted() const                   { return std::max<int64_t>(m_slotStatCompleted() - completed_baseline(), 0); }
+   void                set_completed_baseline(uint64_t b)           { m_completedBaseline = b; }
+ 
++  size_t              metadata_size() const                        { return m_metadataSize; }
++  void                set_metadata_size(size_t size)               { m_metadataSize = size; }
++
+   uint32_t            size_pex() const                             { return m_sizePex; }
+   void                set_size_pex(uint32_t b)                     { m_sizePex = b; }
+ 
+@@ -165,6 +173,7 @@ private:
+   bool                m_isCompact;
+   bool                m_isAcceptingNewPeers;
+   bool                m_isPrivate;
++  bool                m_isMetaDownload;
+   bool                m_pexEnabled;
+   bool                m_pexActive;
+ 
+@@ -176,6 +185,7 @@ private:
+   uint64_t            m_completedBaseline;
+   uint32_t            m_sizePex;
+   uint32_t            m_maxSizePex;
++  size_t              m_metadataSize;
+ 
+   slot_stat_type      m_slotStatCompleted;
+   slot_stat_type      m_slotStatLeft;
+diff --git a/src/download/download_main.cc b/src/download/download_main.cc
+index 1dd5f98..5691021 100644
+--- a/src/download/download_main.cc
++++ b/src/download/download_main.cc
+@@ -455,4 +455,19 @@ DownloadMain::do_peer_exchange() {
+   }
+ }
+ 
++void
++DownloadMain::set_metadata_size(size_t size) {
++  if (m_info->is_meta_download()) {
++    if (m_fileList.size_bytes() < 2)
++      file_list()->reset_filesize(size);
++    else if (size != m_fileList.size_bytes())
++      throw communication_error("Peer-supplied metadata size mismatch.");
++
++  } else if (m_info->metadata_size() && m_info->metadata_size() != size) {
++      throw communication_error("Peer-supplied metadata size mismatch.");
++  }
++
++  m_info->set_metadata_size(size);
++}
++
+ }
+diff --git a/src/download/download_main.h b/src/download/download_main.h
+index 5d0090b..700f41e 100644
+--- a/src/download/download_main.h
++++ b/src/download/download_main.h
+@@ -116,6 +116,8 @@ public:
+ 
+   bool                want_pex_msg()                             { return m_info->is_pex_active() && m_peerList.available_list()->want_more(); }; 
+ 
++  void                set_metadata_size(size_t s);
++
+   // Carefull with these.
+   void                setup_delegator();
+   void                setup_tracker();
+diff --git a/src/net/data_buffer.h b/src/net/data_buffer.h
+index a26ca36..e3d9e38 100644
+--- a/src/net/data_buffer.h
++++ b/src/net/data_buffer.h
+@@ -48,6 +48,7 @@ struct DataBuffer {
+   DataBuffer(char* data, char* end)   : m_data(data), m_end(end),  m_owned(true) {}
+ 
+   DataBuffer          clone() const        { DataBuffer d = *this; d.m_owned = false; return d; }
++  DataBuffer          release()            { DataBuffer d = *this; set(NULL, NULL, false); return d; }
+ 
+   char*               data() const         { return m_data; }
+   char*               end() const          { return m_end; }
+@@ -70,7 +71,7 @@ private:
+ 
+ inline void
+ DataBuffer::clear() {
+-  if (!empty())
++  if (!empty() && m_owned)
+     delete[] m_data;
+ 
+   m_data = m_end = NULL;
+diff --git a/src/net/socket_base.cc b/src/net/socket_base.cc
+index 90457dc..13a9c8b 100644
+--- a/src/net/socket_base.cc
++++ b/src/net/socket_base.cc
+@@ -47,7 +47,7 @@
+ 
+ namespace torrent {
+ 
+-char* SocketBase::m_nullBuffer = new char[1 << 17];
++char* SocketBase::m_nullBuffer = new char[SocketBase::null_buffer_size];
+ 
+ SocketBase::~SocketBase() {
+   if (get_fd().is_valid())
+diff --git a/src/net/socket_base.h b/src/net/socket_base.h
+index 9340a23..0f0f424 100644
+--- a/src/net/socket_base.h
++++ b/src/net/socket_base.h
+@@ -68,6 +68,8 @@ protected:
+   SocketBase(const SocketBase&);
+   void operator = (const SocketBase&);
+ 
++  static const size_t null_buffer_size = 1 << 17;
++
+   static char*        m_nullBuffer;
+ };
+ 
+diff --git a/src/protocol/Makefile.am b/src/protocol/Makefile.am
+index 6171d06..18f671d 100644
+--- a/src/protocol/Makefile.am
++++ b/src/protocol/Makefile.am
+@@ -17,6 +17,8 @@ libsub_protocol_la_SOURCES = \
+ 	peer_connection_base.h \
+ 	peer_connection_leech.cc \
+ 	peer_connection_leech.h \
++	peer_connection_metadata.cc \
++	peer_connection_metadata.h \
+ 	peer_factory.cc \
+ 	peer_factory.h \
+ 	protocol_base.h \
+diff --git a/src/protocol/extensions.cc b/src/protocol/extensions.cc
+index 7cbf6e3..3e0cf60 100644
+--- a/src/protocol/extensions.cc
++++ b/src/protocol/extensions.cc
+@@ -43,6 +43,8 @@
+ 
+ #include "download/available_list.h"
+ #include "download/download_main.h"
++#include "download/download_manager.h"
++#include "download/download_wrapper.h"
+ #include "protocol/peer_connection_base.h"
+ #include "torrent/connection_manager.h"
+ #include "torrent/object.h"
+@@ -58,7 +60,9 @@ namespace torrent {
+ 
+ enum ext_handshake_keys {
+   key_e,
++  key_m_utMetadata,
+   key_m_utPex,
++  key_metadataSize,
+   key_p,
+   key_reqq,
+   key_v,
+@@ -70,6 +74,13 @@ enum ext_pex_keys {
+   key_pex_LAST
+ };
+ 
++enum ext_metadata_keys {
++  key_msgType,
++  key_piece,
++  key_totalSize,
++  key_metadata_LAST
++};
++
+ class ExtHandshakeMessage : public StaticMap<ext_handshake_keys, key_handshake_LAST> {
+ public:
+   typedef StaticMap<ext_handshake_keys, key_handshake_LAST> base_type;
+@@ -82,9 +93,17 @@ public:
+   typedef StaticMapKeys::mapping_type   mapping_type;
+ };
+ 
++class ExtMetadataMessage : public StaticMap<ext_metadata_keys, key_metadata_LAST> {
++public:
++  typedef StaticMap<ext_metadata_keys, key_metadata_LAST> base_type;
++  typedef StaticMapKeys::mapping_type   mapping_type;
++};
++
+ ExtHandshakeMessage::mapping_type ext_handshake_key_names[ExtHandshakeMessage::length] = {
+   { key_e,            "e" },
++  { key_m_utMetadata, "m::ut_metadata" },
+   { key_m_utPex,      "m::ut_pex" },
++  { key_metadataSize, "metadata_size" },
+   { key_p,            "p" },
+   { key_reqq,         "reqq" },
+   { key_v,            "v" },
+@@ -94,9 +113,16 @@ ExtPEXMessage::mapping_type ext_pex_key_names[ExtPEXMessage::length] = {
+   { key_pex_added,    "added" },
+ };
+ 
++ExtMetadataMessage::mapping_type ext_metadata_key_names[ExtMetadataMessage::length] = {
++  { key_msgType,      "msg_type" },
++  { key_piece,        "piece" },
++  { key_totalSize,    "total_size" },
++};
++
+ ext_handshake_keys message_keys[ProtocolExtension::FIRST_INVALID] = {
+   key_handshake_LAST,     // Handshake, not actually used.
+   key_m_utPex,
++  key_m_utMetadata,
+ };
+ 
+ template<>
+@@ -105,6 +131,9 @@ const ExtHandshakeMessage::key_map_init ExtHandshakeMessage::base_type::keyMap(e
+ template<>
+ const ExtPEXMessage::key_map_init ExtPEXMessage::base_type::keyMap(ext_pex_key_names);
+ 
++template<>
++const ExtMetadataMessage::key_map_init ExtMetadataMessage::base_type::keyMap(ext_metadata_key_names);
++
+ void
+ ProtocolExtension::cleanup() {
+ //   if (is_default())
+@@ -160,7 +189,11 @@ ProtocolExtension::generate_handshake_message() {
+   message[key_v] = SimpleString("libTorrent " VERSION);
+   message[key_reqq] = 2048;  // maximum request queue size
+ 
++  if (!m_download->info()->is_meta_download())
++    message[key_metadataSize] = m_download->info()->metadata_size();
++
+   message[key_m_utPex] = is_local_enabled(UT_PEX) ? UT_PEX : 0;
++  message[key_m_utMetadata] = UT_METADATA;
+ 
+   char buffer[1024];
+   object_buffer_t result = staticMap_write_bencode_c(object_write_to_buffer, NULL, std::make_pair(buffer, buffer + sizeof(buffer)), message);
+@@ -224,7 +257,7 @@ ProtocolExtension::generate_ut_pex_message(const PEXList& added, const PEXList&
+ 
+ void
+ ProtocolExtension::read_start(int type, uint32_t length, bool skip) {
+-  if (is_default() || (type >= FIRST_INVALID) || length > (1 << 14))
++  if (is_default() || (type >= FIRST_INVALID) || length > (1 << 15))
+     throw communication_error("Received invalid extension message.");
+ 
+   if (m_read != NULL || length < 0)
+@@ -244,19 +277,25 @@ ProtocolExtension::read_start(int type, uint32_t length, bool skip) {
+   m_readPos = m_read = new char[length];
+ }
+ 
+-void
++bool
+ ProtocolExtension::read_done() {
++  bool blocked = false;
++
+   try {
+     switch(m_readType) {
+     case SKIP_EXTENSION:
+       break;
+ 
+     case HANDSHAKE:
+-      parse_handshake();
++      blocked = parse_handshake();
+       break;
+ 
+     case UT_PEX:
+-      parse_ut_pex();
++      blocked = parse_ut_pex();
++      break;
++
++    case UT_METADATA:
++      blocked = parse_ut_metadata();
+       break;
+ 
+     default:
+@@ -272,6 +311,8 @@ ProtocolExtension::read_done() {
+ 
+   m_readType = FIRST_INVALID;
+   m_flags |= flag_received_ext;
++
++  return !blocked;
+ }
+ 
+ // Called whenever peer enables or disables an extension.
+@@ -285,7 +326,7 @@ ProtocolExtension::peer_toggle_remote(int type, bool active) {
+   }
+ }
+ 
+-void
++bool
+ ProtocolExtension::parse_handshake() {
+   ExtHandshakeMessage message;
+   staticMap_read_bencode(m_read, m_readPos, message);
+@@ -323,10 +364,15 @@ ProtocolExtension::parse_handshake() {
+   if (message[key_reqq].is_value())
+     m_maxQueueLength = message[key_reqq].as_value();
+ 
++  if (message[key_metadataSize].is_value())
++    m_download->set_metadata_size(message[key_metadataSize].as_value());
++
+   m_flags &= ~flag_initial_handshake;
++
++  return false;
+ }
+ 
+-void
++bool
+ ProtocolExtension::parse_ut_pex() {
+   // Ignore message if we're still in the handshake (no connection
+   // yet), or no peers are present.
+@@ -336,11 +382,11 @@ ProtocolExtension::parse_ut_pex() {
+ 
+   // TODO: Check if pex is enabled?
+   if (!message[key_pex_added].is_sstring())
+-    return;
++    return false;
+ 
+   SimpleString peers = message[key_pex_added].as_sstring();
+   if (peers.empty())
+-    return;
++    return false;
+ 
+   AddressList l;
+   l.parse_address_compact(peers);
+@@ -348,6 +394,82 @@ ProtocolExtension::parse_ut_pex() {
+   l.erase(std::unique(l.begin(), l.end()), l.end());
+  
+   m_download->peer_list()->insert_available(&l);
++
++  return false;
++}
++
++bool
++ProtocolExtension::parse_ut_metadata() {
++  ExtMetadataMessage message;
++
++  // Piece data comes after bencoded extension message.
++  const char* dataStart = staticMap_read_bencode(m_read, m_readPos, message);
++
++  switch(message[key_msgType].as_value()) {
++  case 0:
++    // Can't process new request while still having data to send.
++    if (has_pending_message())
++      return true;
++
++    send_metadata_piece(message[key_piece].as_value());
++    break;
++
++  case 1:
++    if (m_connection == NULL)
++      break;
++
++    m_connection->receive_metadata_piece(message[key_piece].as_value(), dataStart, m_readPos - dataStart);
++    break;
++
++  case 2:
++    if (m_connection != NULL)
++      m_connection->receive_metadata_piece(message[key_piece].as_value(), NULL, 0);
++    break;
++  };
++
++  return false;
++}
++
++void
++ProtocolExtension::send_metadata_piece(size_t piece) {
++  // Reject out-of-range piece, or if we don't have the complete metadata yet.
++  size_t metadataSize = m_download->info()->metadata_size();
++  size_t pieceEnd = (metadataSize + metadata_piece_size - 1) >> metadata_piece_shift;
++
++  if (m_download->info()->is_meta_download() || piece >= pieceEnd) {
++    // reject: { "msg_type" => 2, "piece" => ... }
++    m_pendingType = UT_METADATA;
++    m_pending = build_bencode(40, "d8:msg_typei2e5:piecei%zuee", piece);
++    return;
++  }
++
++  // These messages will be rare, so we'll just build the
++  // metadata here instead of caching it uselessly.
++  char* buffer = new char[metadataSize];
++  object_buffer_t result = object_write_bencode_c(object_write_to_buffer, NULL, object_buffer_t(buffer, buffer + metadataSize), 
++                                                 &(*manager->download_manager()->find(m_download->info()))->bencode()->get_key("info"));
++
++  // data: { "msg_type" => 1, "piece" => ..., "total_size" => ... } followed by piece data (outside of dictionary)
++  size_t length = piece == pieceEnd - 1 ? m_download->info()->metadata_size() % metadata_piece_size : metadata_piece_size;
++  m_pendingType = UT_METADATA;
++  m_pending = build_bencode(length + 128, "d8:msg_typei1e5:piecei%zue10:total_sizei%zuee", piece, metadataSize);
++
++  memcpy(m_pending.end(), buffer + (piece << metadata_piece_shift), length);
++  m_pending.set(m_pending.data(), m_pending.end() + length, m_pending.owned());
++  delete [] buffer;
++}
++
++bool
++ProtocolExtension::request_metadata_piece(const Piece* p) {
++  if (p->offset() % metadata_piece_size)
++    throw internal_error("ProtocolExtension::request_metadata_piece got misaligned piece offset.");
++
++  if (has_pending_message())
++    return false;
++
++  m_pendingType = UT_METADATA;
++  m_pending = build_bencode(40, "d8:msg_typei0e5:piecei%uee", (unsigned)(p->offset() >> metadata_piece_shift));
++  return true;
+ }
+ 
+ }
+diff --git a/src/protocol/extensions.h b/src/protocol/extensions.h
+index 96ed652..485e7d7 100644
+--- a/src/protocol/extensions.h
++++ b/src/protocol/extensions.h
+@@ -60,6 +60,7 @@ public:
+   typedef enum {
+     HANDSHAKE = 0,
+     UT_PEX,
++    UT_METADATA,
+ 
+     FIRST_INVALID,    // first invalid message ID
+ 
+@@ -81,6 +82,10 @@ public:
+   // Number of extensions we support, not counting handshake.
+   static const int    extension_count = FIRST_INVALID - HANDSHAKE - 1;
+ 
++  // Fixed size of a metadata piece (16 KB).
++  static const size_t metadata_piece_shift = 14;
++  static const size_t metadata_piece_size  = 1 << metadata_piece_shift;
++
+   ProtocolExtension();
+   ~ProtocolExtension() { delete [] m_read; }
+ 
+@@ -91,6 +96,7 @@ public:
+   static ProtocolExtension make_default();
+ 
+   void                set_info(PeerInfo* peerInfo, DownloadMain* download) { m_peerInfo = peerInfo; m_download = download; }
++  void                set_connection(PeerConnectionBase* c)                { m_connection = c; }
+ 
+   DataBuffer          generate_handshake_message();
+   static DataBuffer   generate_toggle_message(MessageType t, bool on);
+@@ -112,7 +118,7 @@ public:
+ 
+   // Handle reading extension data from peer.
+   void                read_start(int type, uint32_t length, bool skip);
+-  void                read_done();
++  bool                read_done();
+ 
+   char*               read_position()                  { return m_readPos; }
+   bool                read_move(uint32_t v)            { m_readPos += v; return (m_readLeft -= v) == 0; }
+@@ -132,13 +138,23 @@ public:
+   void                clear_initial_pex()              { m_flags &= ~flag_initial_pex; }
+   void                reset()                          { std::memset(&m_idMap, 0, sizeof(m_idMap)); }
+ 
++  bool                request_metadata_piece(const Piece* p);
++
++  // To handle cases where the extension protocol needs to send a reply.
++  bool                has_pending_message() const      { return m_pendingType != HANDSHAKE; }
++  MessageType         pending_message_type() const     { return m_pendingType; }
++  DataBuffer          pending_message_data()           { return m_pending.release(); }
++  void                clear_pending_message()          { if (m_pending.empty()) m_pendingType = HANDSHAKE; }
++
+ private:
+-  void                parse_handshake();
+-  void                parse_ut_pex();
++  bool                parse_handshake();
++  bool                parse_ut_pex();
++  bool                parse_ut_metadata();
+ 
+   static DataBuffer   build_bencode(size_t maxLength, const char* format, ...) ATTRIBUTE_PRINTF(2);
+ 
+   void                peer_toggle_remote(int type, bool active);
++  void                send_metadata_piece(size_t piece);
+ 
+   // Map of IDs peer uses for each extension message type, excluding
+   // HANDSHAKE. 
+@@ -149,11 +165,15 @@ private:
+   int                 m_flags;
+   PeerInfo*           m_peerInfo;
+   DownloadMain*       m_download;
++  PeerConnectionBase* m_connection;
+ 
+   uint8_t             m_readType;
+   uint32_t            m_readLeft;
+   char*               m_read;
+   char*               m_readPos;
++
++  MessageType         m_pendingType;
++  DataBuffer          m_pending;
+ };
+ 
+ inline
+@@ -163,10 +183,13 @@ ProtocolExtension::ProtocolExtension() :
+   m_flags(flag_local_enabled_base | flag_remote_supported_base | flag_initial_handshake),
+   m_peerInfo(NULL),
+   m_download(NULL),
++  m_connection(NULL),
+   m_readType(FIRST_INVALID),
+-  m_read(NULL) {
++  m_read(NULL),
++  m_pendingType(HANDSHAKE) {
+ 
+   reset();
++  set_local_enabled(UT_METADATA);
+ }
+ 
+ inline ProtocolExtension
+diff --git a/src/protocol/handshake.cc b/src/protocol/handshake.cc
+index d863f7b..7fb389b 100644
+--- a/src/protocol/handshake.cc
++++ b/src/protocol/handshake.cc
+@@ -723,6 +723,17 @@ restart:
+ 
+     case READ_MESSAGE:
+     case POST_HANDSHAKE:
++      // For meta-downloads, we aren't interested in the bitfield or
++      // extension messages here, PCMetadata handles all that. The
++      // bitfield only refers to the single-chunk meta-data, so fake that.
++      if (m_download->info()->is_meta_download()) {
++        m_bitfield.set_size_bits(1);
++        m_bitfield.allocate();
++        m_bitfield.set(0);
++        read_done();
++        break;
++      }
++
+       fill_read_buffer(5);
+ 
+       // Received a keep-alive message which means we won't be
+@@ -1022,6 +1033,10 @@ Handshake::prepare_peer_info() {
+   std::memcpy(m_peerInfo->set_options(), m_options, 8);
+   m_peerInfo->mutable_id().assign((const char*)m_readBuffer.position());
+   m_readBuffer.consume(20);
++
++  // For meta downloads, we require support of the extension protocol.
++  if (m_download->info()->is_meta_download() && !m_peerInfo->supports_extensions())
++    throw handshake_error(ConnectionManager::handshake_dropped, e_handshake_unwanted_connection);
+ }
+ 
+ void
+diff --git a/src/protocol/peer_connection_base.cc b/src/protocol/peer_connection_base.cc
+index ab043a6..815ea93 100644
+--- a/src/protocol/peer_connection_base.cc
++++ b/src/protocol/peer_connection_base.cc
+@@ -93,8 +93,7 @@ PeerConnectionBase::~PeerConnectionBase() {
+   if (m_extensions != NULL && !m_extensions->is_default())
+     delete m_extensions;
+ 
+-  if (m_extensionMessage.owned())
+-    m_extensionMessage.clear();
++  m_extensionMessage.clear();
+ }
+ 
+ void
+@@ -116,6 +115,8 @@ PeerConnectionBase::initialize(DownloadMain* download, PeerInfo* peerInfo, Socke
+   m_encryption = *encryptionInfo;
+   m_extensions = extensions;
+ 
++  m_extensions->set_connection(this);
++
+   m_peerChunks.set_peer_info(m_peerInfo);
+   m_peerChunks.bitfield()->swap(*bitfield);
+ 
+@@ -581,8 +582,12 @@ PeerConnectionBase::down_extension() {
+     m_extensions->read_move(bytes);
+   }
+ 
+-  if (m_extensions->is_complete())
+-    m_extensions->read_done();
++  // If extension can't be processed yet (due to a pending write),
++  // disable reads until the pending message is completely sent.
++  if (m_extensions->is_complete() && !m_extensions->is_invalid() && !m_extensions->read_done()) {
++    manager->poll()->remove_read(this);
++    return false;
++  }
+ 
+   return m_extensions->is_complete();
+ }
+@@ -693,12 +698,15 @@ PeerConnectionBase::up_extension() {
+   if (m_extensionOffset < m_extensionMessage.length())
+     return false;
+ 
+-  // clear() deletes the buffer, only do that if we made a copy,
+-  // otherwise the buffer is shared among all connections.
+-  if (m_extensionMessage.owned())
+-    m_extensionMessage.clear();
+-  else 
+-    m_extensionMessage.set(NULL, NULL, false);
++  m_extensionMessage.clear();
++
++  // If we have an unprocessed message, process it now and enable reads again.
++  if (m_extensions->is_complete() && !m_extensions->is_invalid()) {
++    if (!m_extensions->read_done())
++      throw internal_error("PeerConnectionBase::up_extension could not process complete extension message.");
++
++    manager->poll()->insert_read(this);
++  }
+ 
+   return true;
+ }
+@@ -857,4 +865,16 @@ PeerConnectionBase::send_pex_message() {
+   return true;
+ }
+ 
++// Extension protocol needs to send a reply.
++bool
++PeerConnectionBase::send_ext_message() {
++  write_prepare_extension(m_extensions->pending_message_type(), m_extensions->pending_message_data());
++  m_extensions->clear_pending_message();
++  return true;
++}
++
++void
++PeerConnectionBase::receive_metadata_piece(uint32_t piece, const char* data, uint32_t length) {
++}
++
+ }
+diff --git a/src/protocol/peer_connection_base.h b/src/protocol/peer_connection_base.h
+index 2994963..d131341 100644
+--- a/src/protocol/peer_connection_base.h
++++ b/src/protocol/peer_connection_base.h
+@@ -140,6 +140,9 @@ public:
+   void                read_insert_poll_safe();
+   void                write_insert_poll_safe();
+ 
++  // Communication with the protocol extensions
++  virtual void        receive_metadata_piece(uint32_t piece, const char* data, uint32_t length);
++
+ protected:
+   static const uint32_t extension_must_encrypt = ~uint32_t();
+ 
+@@ -179,6 +182,7 @@ protected:
+   bool                try_request_pieces();
+ 
+   bool                send_pex_message();
++  bool                send_ext_message();
+ 
+   DownloadMain*       m_download;
+ 
+diff --git a/src/protocol/peer_connection_leech.cc b/src/protocol/peer_connection_leech.cc
+index a75d333..36c6d7a 100644
+--- a/src/protocol/peer_connection_leech.cc
++++ b/src/protocol/peer_connection_leech.cc
+@@ -333,9 +333,13 @@ PeerConnection<type>::read_message() {
+       m_down->set_state(ProtocolRead::READ_EXTENSION);
+     }
+ 
+-    if (down_extension())
+-      m_down->set_state(ProtocolRead::IDLE);
++    if (!down_extension())
++      return false;
+ 
++    if (m_extensions->has_pending_message())
++      write_insert_poll_safe();
++
++    m_down->set_state(ProtocolRead::IDLE);
+     return true;
+ 
+   default:
+@@ -433,6 +437,9 @@ PeerConnection<type>::event_read() {
+         if (!down_extension())
+           return;
+ 
++        if (m_extensions->has_pending_message())
++          write_insert_poll_safe();
++
+         m_down->set_state(ProtocolRead::IDLE);
+         break;
+ 
+@@ -546,6 +553,10 @@ PeerConnection<type>::fill_write_buffer() {
+       send_pex_message()) {
+     // Don't do anything else if send_pex_message() succeeded.
+ 
++  } else if (m_extensions->has_pending_message() && m_up->can_write_extension() &&
++             send_ext_message()) {
++    // Same.
++
+   } else if (!m_upChoke.choked() &&
+              !m_peerChunks.upload_queue()->empty() &&
+              m_up->can_write_piece() &&
+diff --git a/src/protocol/peer_connection_metadata.cc b/src/protocol/peer_connection_metadata.cc
+new file mode 100644
+index 0000000..24f13ca
+--- /dev/null
++++ b/src/protocol/peer_connection_metadata.cc
+@@ -0,0 +1,461 @@
++// libTorrent - BitTorrent library
++// Copyright (C) 2005-2007, Jari Sundell
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++// 
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++// 
++// You should have received a copy of the GNU General Public License
++// along with this program; if not, write to the Free Software
++// Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++//
++// In addition, as a special exception, the copyright holders give
++// permission to link the code of portions of this program with the
++// OpenSSL library under certain conditions as described in each
++// individual source file, and distribute linked combinations
++// including the two.
++//
++// You must obey the GNU General Public License in all respects for
++// all of the code used other than OpenSSL.  If you modify file(s)
++// with this exception, you may extend this exception to your version
++// of the file(s), but you are not obligated to do so.  If you do not
++// wish to do so, delete this exception statement from your version.
++// If you delete this exception statement from all source files in the
++// program, then also delete it here.
++//
++// Contact:  Jari Sundell <jaris@ifi.uio.no>
++//
++//           Skomakerveien 33
++//           3185 Skoppum, NORWAY
++
++#include "config.h"
++
++#include <cstring>
++#include <sstream>
++
++#include "data/chunk_list_node.h"
++#include "download/choke_manager.h"
++#include "download/chunk_selector.h"
++#include "download/chunk_statistics.h"
++#include "download/download_info.h"
++#include "download/download_main.h"
++#include "torrent/dht_manager.h"
++#include "torrent/peer/connection_list.h"
++#include "torrent/peer/peer_info.h"
++
++#include "extensions.h"
++#include "peer_connection_metadata.h"
++
++namespace torrent {
++
++PeerConnectionMetadata::~PeerConnectionMetadata() {
++}
++
++void
++PeerConnectionMetadata::initialize_custom() {
++}
++
++void
++PeerConnectionMetadata::update_interested() {
++}
++
++bool
++PeerConnectionMetadata::receive_keepalive() {
++  if (cachedTime - m_timeLastRead > rak::timer::from_seconds(240))
++    return false;
++
++  m_tryRequest = true;
++
++  // There's no point in adding ourselves to the write poll if the
++  // buffer is full, as that will already have been taken care of.
++  if (m_up->get_state() == ProtocolWrite::IDLE &&
++      m_up->can_write_keepalive()) {
++
++    write_insert_poll_safe();
++
++    ProtocolBuffer<512>::iterator old_end = m_up->buffer()->end();
++    m_up->write_keepalive();
++
++    if (is_encrypted())
++      m_encryption.encrypt(old_end, m_up->buffer()->end() - old_end);
++  }
++
++  return true;
++}
++
++// We keep the message in the buffer if it is incomplete instead of
++// keeping the state and remembering the read information. This
++// shouldn't happen very often compared to full reads.
++inline bool
++PeerConnectionMetadata::read_message() {
++  ProtocolBuffer<512>* buf = m_down->buffer();
++
++  if (buf->remaining() < 4)
++    return false;
++
++  // Remember the start of the message so we may reset it if we don't
++  // have the whole message.
++  ProtocolBuffer<512>::iterator beginning = buf->position();
++
++  uint32_t length = buf->read_32();
++
++  if (length == 0) {
++    // Keepalive message.
++    m_down->set_last_command(ProtocolBase::KEEP_ALIVE);
++
++    return true;
++
++  } else if (buf->remaining() < 1) {
++    buf->set_position_itr(beginning);
++    return false;
++
++  } else if (length > (1 << 20)) {
++    throw communication_error("PeerConnection::read_message() got an invalid message length.");
++  }
++    
++  m_down->set_last_command((ProtocolBase::Protocol)buf->peek_8());
++
++  // Ignore most messages, they aren't relevant for a metadata download.
++  switch (buf->read_8()) {
++  case ProtocolBase::CHOKE:
++  case ProtocolBase::UNCHOKE:
++  case ProtocolBase::INTERESTED:
++  case ProtocolBase::NOT_INTERESTED:
++    return true;
++
++  case ProtocolBase::HAVE:
++    if (!m_down->can_read_have_body())
++      break;
++
++    buf->read_32();
++    return true;
++
++  case ProtocolBase::REQUEST:
++    if (!m_down->can_read_request_body())
++      break;
++
++    m_down->read_request();
++    return true;
++
++  case ProtocolBase::PIECE:
++    throw communication_error("Received a piece but the connection is strictly for meta data.");
++
++  case ProtocolBase::CANCEL:
++    if (!m_down->can_read_cancel_body())
++      break;
++
++    m_down->read_request();
++    return true;
++
++  case ProtocolBase::PORT:
++    if (!m_down->can_read_port_body())
++      break;
++
++    manager->dht_manager()->add_node(m_peerInfo->socket_address(), m_down->buffer()->read_16());
++    return true;
++
++  case ProtocolBase::EXTENSION_PROTOCOL:
++    if (!m_down->can_read_extension_body())
++      break;
++
++    if (m_extensions->is_default()) {
++      m_extensions = new ProtocolExtension();
++      m_extensions->set_info(m_peerInfo, m_download);
++    }
++
++    {
++      int extension = m_down->buffer()->read_8();
++      m_extensions->read_start(extension, length - 2, (extension == ProtocolExtension::UT_PEX) && !m_download->want_pex_msg());
++      m_down->set_state(ProtocolRead::READ_EXTENSION);
++    }
++
++    if (!down_extension())
++      return false;
++
++    // Drop peer if it disabled the metadata extension.
++    if (!m_extensions->is_remote_supported(ProtocolExtension::UT_METADATA))
++      throw close_connection();
++
++    m_down->set_state(ProtocolRead::IDLE);
++    m_tryRequest = true;
++    write_insert_poll_safe();
++
++    return true;
++
++  case ProtocolBase::BITFIELD:
++    // Discard the bitfield sent by the peer.
++    m_skipLength = length - 1;
++    m_down->set_state(ProtocolRead::READ_SKIP_PIECE);
++    return false;
++
++  default:
++    throw communication_error("Received unsupported message type.");
++  }
++
++  // We were unsuccessfull in reading the message, need more data.
++  buf->set_position_itr(beginning);
++  return false;
++}
++
++void
++PeerConnectionMetadata::event_read() {
++  m_timeLastRead = cachedTime;
++
++  // Need to make sure ProtocolBuffer::end() is pointing to the end of
++  // the unread data, and that the unread data starts from the
++  // beginning of the buffer. Or do we use position? Propably best,
++  // therefor ProtocolBuffer::position() points to the beginning of
++  // the unused data.
++
++  try {
++    
++    // Normal read.
++    //
++    // We rarely will read zero bytes as the read of 64 bytes will
++    // almost always either not fill up or it will require additional
++    // reads.
++    //
++    // Only loop when end hits 64.
++
++    do {
++      switch (m_down->get_state()) {
++      case ProtocolRead::IDLE:
++        if (m_down->buffer()->size_end() < read_size) {
++          unsigned int length = read_stream_throws(m_down->buffer()->end(), read_size - m_down->buffer()->size_end());
++          m_down->throttle()->node_used_unthrottled(length);
++
++          if (is_encrypted())
++            m_encryption.decrypt(m_down->buffer()->end(), length);
++
++          m_down->buffer()->move_end(length);
++        }
++
++        while (read_message());
++        
++        if (m_down->buffer()->size_end() == read_size) {
++          m_down->buffer()->move_unused();
++          break;
++        } else {
++          m_down->buffer()->move_unused();
++          return;
++        }
++
++      case ProtocolRead::READ_EXTENSION:
++        if (!down_extension())
++          return;
++
++        // Drop peer if it disabled the metadata extension.
++        if (!m_extensions->is_remote_supported(ProtocolExtension::UT_METADATA))
++          throw close_connection();
++
++        m_down->set_state(ProtocolRead::IDLE);
++        m_tryRequest = true;
++        write_insert_poll_safe();
++        break;
++
++      // Actually skipping the bitfield.
++      // We never receive normal piece messages anyway.
++      case ProtocolRead::READ_SKIP_PIECE:
++        if (!read_skip_bitfield())
++          return;
++
++        m_down->set_state(ProtocolRead::IDLE);
++        break;
++
++      default:
++        throw internal_error("PeerConnection::event_read() wrong state.");
++      }
++
++      // Figure out how to get rid of the shouldLoop boolean.
++    } while (true);
++
++  // Exception handlers:
++
++  } catch (close_connection& e) {
++    m_download->connection_list()->erase(this, 0);
++
++  } catch (blocked_connection& e) {
++    m_download->info()->signal_network_log().emit("Momentarily blocked read connection.");
++    m_download->connection_list()->erase(this, 0);
++
++  } catch (network_error& e) {
++    m_download->connection_list()->erase(this, 0);
++
++  } catch (storage_error& e) {
++    m_download->info()->signal_storage_error().emit(e.what());
++    m_download->connection_list()->erase(this, 0);
++
++  } catch (base_error& e) {
++    std::stringstream s;
++    s << "Connection read fd(" << get_fd().get_fd() << ',' << m_down->get_state() << ',' << m_down->last_command() << ") \"" << e.what() << '"';
++
++    throw internal_error(s.str());
++  }
++}
++
++inline void
++PeerConnectionMetadata::fill_write_buffer() {
++  ProtocolBuffer<512>::iterator old_end = m_up->buffer()->end();
++
++  if (m_tryRequest)
++    m_tryRequest = try_request_metadata_pieces();
++
++  if (m_sendPEXMask && m_up->can_write_extension() &&
++      send_pex_message()) {
++    // Don't do anything else if send_pex_message() succeeded.
++
++  } else if (m_extensions->has_pending_message() && m_up->can_write_extension() &&
++             send_ext_message()) {
++    // Same.
++  }
++
++  if (is_encrypted())
++    m_encryption.encrypt(old_end, m_up->buffer()->end() - old_end);
++}
++
++void
++PeerConnectionMetadata::event_write() {
++  try {
++  
++    do {
++
++      switch (m_up->get_state()) {
++      case ProtocolWrite::IDLE:
++
++        fill_write_buffer();
++
++        if (m_up->buffer()->remaining() == 0) {
++          manager->poll()->remove_write(this);
++          return;
++        }
++
++        m_up->set_state(ProtocolWrite::MSG);
++
++      case ProtocolWrite::MSG:
++        if (!m_up->buffer()->consume(m_up->throttle()->node_used_unthrottled(write_stream_throws(m_up->buffer()->position(), m_up->buffer()->remaining()))))
++          return;
++
++        m_up->buffer()->reset();
++
++        if (m_up->last_command() != ProtocolBase::EXTENSION_PROTOCOL) {
++          m_up->set_state(ProtocolWrite::IDLE);
++          break;
++        }
++
++        m_up->set_state(ProtocolWrite::WRITE_EXTENSION);
++
++      case ProtocolWrite::WRITE_EXTENSION:
++        if (!up_extension())
++          return;
++
++        m_up->set_state(ProtocolWrite::IDLE);
++        break;
++
++      default:
++        throw internal_error("PeerConnection::event_write() wrong state.");
++      }
++
++    } while (true);
++
++  } catch (close_connection& e) {
++    m_download->connection_list()->erase(this, 0);
++
++  } catch (blocked_connection& e) {
++    m_download->info()->signal_network_log().emit("Momentarily blocked write connection.");
++    m_download->connection_list()->erase(this, 0);
++
++  } catch (network_error& e) {
++    m_download->connection_list()->erase(this, 0);
++
++  } catch (storage_error& e) {
++    m_download->info()->signal_storage_error().emit(e.what());
++    m_download->connection_list()->erase(this, 0);
++
++  } catch (base_error& e) {
++    std::stringstream s;
++    s << "Connection write fd(" << get_fd().get_fd() << ',' << m_up->get_state() << ',' << m_up->last_command() << ") \"" << e.what() << '"';
++
++    throw internal_error(s.str());
++  }
++}
++
++bool
++PeerConnectionMetadata::read_skip_bitfield() {
++  if (m_down->buffer()->remaining()) {
++    uint32_t length = std::min(m_skipLength, (uint32_t)m_down->buffer()->remaining());
++    m_down->buffer()->consume(length);
++    m_skipLength -= length;
++  }
++
++  if (m_skipLength) {
++    uint32_t length = std::min(m_skipLength, (uint32_t)null_buffer_size);
++    length = read_stream_throws(m_nullBuffer, length);
++    if (!length)
++      return false;
++    m_skipLength -= length;
++  }
++
++  return !m_skipLength;
++}
++
++// Same as the PCB code, but only one at a time and with the extension protocol.
++bool
++PeerConnectionMetadata::try_request_metadata_pieces() {
++  if (m_download->file_list()->chunk_size() == 1 || !m_extensions->is_remote_supported(ProtocolExtension::UT_METADATA))
++    return false;
++
++  if (download_queue()->queued_empty())
++    m_downStall = 0;
++
++  uint32_t pipeSize = download_queue()->calculate_pipe_size(m_peerChunks.download_throttle()->rate()->rate());
++
++  // Don't start requesting if we can't do it in large enough chunks.
++  if (download_queue()->queued_size() >= (pipeSize + 10) / 2)
++    return false;
++
++  if (!download_queue()->queued_size() < pipeSize || !m_up->can_write_extension() ||
++      m_extensions->has_pending_message())
++    return false;
++
++  const Piece* p = download_queue()->delegate();
++
++  if (p == NULL)
++    return false;
++
++  if (!m_download->file_list()->is_valid_piece(*p) || !m_peerChunks.bitfield()->get(p->index()))
++    throw internal_error("PeerConnectionMetadata::try_request_metadata_pieces() tried to use an invalid piece.");
++
++  return m_extensions->request_metadata_piece(p);
++}
++
++void
++PeerConnectionMetadata::receive_metadata_piece(uint32_t piece, const char* data, uint32_t length) {
++  if (data == NULL) {
++    // Length is not set in a reject message.
++    length = ProtocolExtension::metadata_piece_size;
++    if ((piece << ProtocolExtension::metadata_piece_shift) + ProtocolExtension::metadata_piece_size >= m_download->file_list()->size_bytes())
++      length = m_download->file_list()->chunk_size() % ProtocolExtension::metadata_piece_size;
++    m_tryRequest = false;
++    read_cancel_piece(Piece(0, piece << ProtocolExtension::metadata_piece_shift, length));
++    return;
++  }
++
++  if (!down_chunk_start(Piece(0, piece << ProtocolExtension::metadata_piece_shift, length)))
++    down_chunk_skip_process(data, length);
++  else
++    down_chunk_process(data, length);
++
++  if (!m_downloadQueue.transfer()->is_finished())
++    throw internal_error("PeerConnectionMetadata::receive_metadata_piece did not have complete piece.");
++
++  m_tryRequest = true;
++  down_chunk_finished();
++}
++
++}
+diff --git a/src/protocol/peer_connection_metadata.h b/src/protocol/peer_connection_metadata.h
+new file mode 100644
+index 0000000..127700a
+--- /dev/null
++++ b/src/protocol/peer_connection_metadata.h
+@@ -0,0 +1,73 @@
++// libTorrent - BitTorrent library
++// Copyright (C) 2005-2007, Jari Sundell
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++// 
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++// 
++// You should have received a copy of the GNU General Public License
++// along with this program; if not, write to the Free Software
++// Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++//
++// In addition, as a special exception, the copyright holders give
++// permission to link the code of portions of this program with the
++// OpenSSL library under certain conditions as described in each
++// individual source file, and distribute linked combinations
++// including the two.
++//
++// You must obey the GNU General Public License in all respects for
++// all of the code used other than OpenSSL.  If you modify file(s)
++// with this exception, you may extend this exception to your version
++// of the file(s), but you are not obligated to do so.  If you do not
++// wish to do so, delete this exception statement from your version.
++// If you delete this exception statement from all source files in the
++// program, then also delete it here.
++//
++// Contact:  Jari Sundell <jaris@ifi.uio.no>
++//
++//           Skomakerveien 33
++//           3185 Skoppum, NORWAY
++
++#ifndef LIBTORRENT_PROTOCOL_PEER_CONNECTION_METADATA_H
++#define LIBTORRENT_PROTOCOL_PEER_CONNECTION_METADATA_H
++
++#include "peer_connection_base.h"
++
++#include "torrent/download.h"
++
++namespace torrent {
++
++class PeerConnectionMetadata : public PeerConnectionBase {
++public:
++  ~PeerConnectionMetadata();
++
++  virtual void        initialize_custom();
++  virtual void        update_interested();
++  virtual bool        receive_keepalive();
++
++  virtual void        event_read();
++  virtual void        event_write();
++
++  virtual void        receive_metadata_piece(uint32_t piece, const char* data, uint32_t length);
++
++private:
++  inline bool         read_message();
++
++  bool                read_skip_bitfield();
++
++  bool                try_request_metadata_pieces();
++
++  inline void         fill_write_buffer();
++
++  uint32_t   m_skipLength;
++};
++
++}
++
++#endif
+diff --git a/src/protocol/peer_factory.cc b/src/protocol/peer_factory.cc
+index 7ab9fe8..cfe6a1e 100644
+--- a/src/protocol/peer_factory.cc
++++ b/src/protocol/peer_factory.cc
+@@ -38,6 +38,7 @@
+ 
+ #include "peer_factory.h"
+ #include "peer_connection_leech.h"
++#include "peer_connection_metadata.h"
+ 
+ namespace torrent {
+ 
+@@ -62,4 +63,11 @@ createPeerConnectionInitialSeed(bool encrypted) {
+   return pc;
+ }
+ 
++PeerConnectionBase*
++createPeerConnectionMetadata(bool encrypted) {
++  PeerConnectionBase* pc = new PeerConnectionMetadata;
++
++  return pc;
++}
++
+ }
+diff --git a/src/protocol/peer_factory.h b/src/protocol/peer_factory.h
+index 363a5c3..f22d76f 100644
+--- a/src/protocol/peer_factory.h
++++ b/src/protocol/peer_factory.h
+@@ -44,6 +44,7 @@ class PeerConnectionBase;
+ PeerConnectionBase* createPeerConnectionDefault(bool encrypted);
+ PeerConnectionBase* createPeerConnectionSeed(bool encrypted);
+ PeerConnectionBase* createPeerConnectionInitialSeed(bool encrypted);
++PeerConnectionBase* createPeerConnectionMetadata(bool encrypted);
+ 
+ }
+ 
+diff --git a/src/torrent/data/file_list.cc b/src/torrent/data/file_list.cc
+index 2f5d8d2..7208612 100644
+--- a/src/torrent/data/file_list.cc
++++ b/src/torrent/data/file_list.cc
+@@ -466,6 +466,18 @@ FileList::open(int flags) {
+ 
+   m_isOpen = true;
+   m_frozenRootDir = m_rootDir;
++
++  // For meta-downloads, if the file exists, we have to assume that
++  // it is either 0 or 1 length or the correct size. If the size
++  // turns out wrong later, a communication_error will be thrown elsewhere
++  // to alert the user in this (unlikely) case.
++  if (size_bytes() < 2) {
++    rak::file_stat stat;
++
++    // This probably recurses into open() once, but that is harmless.
++    if (stat.update((*begin())->frozen_path()) && stat.size() > 1)
++      return reset_filesize(stat.size());
++  }
+ }
+ 
+ void
+@@ -661,4 +673,14 @@ FileList::update_completed() {
+   }
+ }
+ 
++void
++FileList::reset_filesize(int64_t size) {
++  close();
++  m_chunkSize = size;
++  m_torrentSize = size;
++  (*begin())->set_size_bytes(size);
++  (*begin())->set_range(m_chunkSize);
++  open(open_no_create);
++}
++
+ }
+diff --git a/src/torrent/data/file_list.h b/src/torrent/data/file_list.h
+index bcc8939..60d418a 100644
+--- a/src/torrent/data/file_list.h
++++ b/src/torrent/data/file_list.h
+@@ -167,6 +167,10 @@ protected:
+   iterator            inc_completed(iterator firstItr, uint32_t index) LIBTORRENT_NO_EXPORT;
+   void                update_completed() LIBTORRENT_NO_EXPORT;
+ 
++  // Used for meta downloads; we only know the
++  // size after the first extension handshake.
++  void                reset_filesize(int64_t) LIBTORRENT_NO_EXPORT;
++
+ private:
+   bool                open_file(File* node, const Path& lastPath, int flags) LIBTORRENT_NO_EXPORT;
+   void                make_directory(Path::const_iterator pathBegin, Path::const_iterator pathEnd, Path::const_iterator startItr) LIBTORRENT_NO_EXPORT;
+diff --git a/src/torrent/download.cc b/src/torrent/download.cc
+index d6cc199..49daad9 100644
+--- a/src/torrent/download.cc
++++ b/src/torrent/download.cc
+@@ -225,6 +225,11 @@ Download::set_pex_enabled(bool enabled) {
+   m_ptr->info()->set_pex_enabled(enabled);
+ }
+ 
++bool
++Download::is_meta_download() const {
++  return m_ptr->info()->is_meta_download();
++}
++
+ const std::string&
+ Download::name() const {
+   if (m_ptr == NULL)
+@@ -504,6 +509,11 @@ Download::connection_type() const {
+ 
+ void
+ Download::set_connection_type(ConnectionType t) {
++  if (m_ptr->info()->is_meta_download()) {
++    m_ptr->main()->connection_list()->slot_new_connection(&createPeerConnectionMetadata);
++    return;
++  }
++
+   switch (t) {
+   case CONNECTION_LEECH:
+     m_ptr->main()->connection_list()->slot_new_connection(&createPeerConnectionDefault);
+diff --git a/src/torrent/download.h b/src/torrent/download.h
+index 5e9700e..5d16d4e 100644
+--- a/src/torrent/download.h
++++ b/src/torrent/download.h
+@@ -100,6 +100,8 @@ public:
+   bool                is_pex_enabled() const;
+   void                set_pex_enabled(bool enabled);
+ 
++  bool                is_meta_download() const;
++
+   // Returns "" if the object is not valid.
+   const std::string&  name() const;
+ 
+@@ -184,6 +186,7 @@ public:
+     CONNECTION_LEECH,
+     CONNECTION_SEED,
+     CONNECTION_INITIAL_SEED,
++    CONNECTION_METADATA,
+   } ConnectionType;
+ 
+   ConnectionType      connection_type() const;
+diff --git a/src/torrent/object_stream.cc b/src/torrent/object_stream.cc
+index 73c816b..9d9a962 100644
+--- a/src/torrent/object_stream.cc
++++ b/src/torrent/object_stream.cc
+@@ -600,4 +600,11 @@ object_write_to_stream(void* data, object_buffer_t buffer) {
+   return buffer;
+ }
+ 
++object_buffer_t
++object_write_to_size(void* data, object_buffer_t buffer) {
++  *reinterpret_cast<uint64_t*>(data) += std::distance(buffer.first, buffer.second);
++
++  return buffer;
++}
++
+ }
+diff --git a/src/torrent/object_stream.h b/src/torrent/object_stream.h
+index b399bf7..3de5d82 100644
+--- a/src/torrent/object_stream.h
++++ b/src/torrent/object_stream.h
+@@ -91,6 +91,9 @@ object_buffer_t staticMap_write_bencode_c_wrap(object_write_t writeFunc, void* d
+ object_buffer_t object_write_to_buffer(void* data, object_buffer_t buffer) LIBTORRENT_EXPORT;
+ object_buffer_t object_write_to_sha1(void* data, object_buffer_t buffer) LIBTORRENT_EXPORT;
+ object_buffer_t object_write_to_stream(void* data, object_buffer_t buffer) LIBTORRENT_EXPORT;
++
++// Measures bencode size, 'data' is uint64_t*.
++object_buffer_t object_write_to_size(void* data, object_buffer_t buffer) LIBTORRENT_EXPORT;
+ }
+ 
+ #endif
+diff --git a/src/torrent/torrent.cc b/src/torrent/torrent.cc
+index e8ffbac..47027cc 100644
+--- a/src/torrent/torrent.cc
++++ b/src/torrent/torrent.cc
+@@ -350,11 +350,22 @@ download_add(Object* object) {
+ 
+   ctor.initialize(*object);
+ 
+-  std::string infoHash = object_sha1(&object->get_key("info"));
++  std::string infoHash;
++  if (download->info()->is_meta_download())
++    infoHash = object->get_key("info").get_key("pieces").as_string();
++  else
++    infoHash = object_sha1(&object->get_key("info"));
+ 
+   if (manager->download_manager()->find(infoHash) != manager->download_manager()->end())
+     throw input_error("Info hash already used by another torrent.");
+ 
++  if (!download->info()->is_meta_download()) {
++    char buffer[1024];
++    uint64_t metadata_size = 0;
++    object_write_bencode_c(&object_write_to_size, &metadata_size, object_buffer_t(buffer, buffer + sizeof(buffer)), &object->get_key("info"));
++    download->main()->set_metadata_size(metadata_size);
++  }
++
+   download->set_hash_queue(manager->hash_queue());
+   download->initialize(infoHash, PEER_NAME + rak::generate_random<std::string>(20 - std::string(PEER_NAME).size()));
+ 

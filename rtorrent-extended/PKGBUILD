@@ -1,0 +1,76 @@
+# Maintainer:  Lucky <aur.archlinux.org [at] lucky.take0ver [dot] net>
+# Contributor: Ashren <edgar [at] archlinux [dot] us>
+# Contributor: Daenyth <Daenyth [at] gmail [dot] com>
+# Contributor: Jeff Mickey <jeff@archlinux.org>
+# Contributor: sh__
+
+pkgname=rtorrent-extended
+_pkgname=rtorrent
+pkgver=0.8.6
+pkgrel=3
+pkgdesc="Ncurses BitTorrent client based on libTorrent with magnet link, IPv6, ipfilter, bad peers, color and trackerinfo patch."
+arch=('i686' 'x86_64')
+url="http://libtorrent.rakshasa.no"
+license=('GPL')
+depends=('libtorrent-extended=0.12.6-3' 'curl>=7.14.3' 'xmlrpc-c>=1858')
+conflicts=('rtorrent')
+provides=('rtorrent')
+install=${pkgname}.install
+source=(http://libtorrent.rakshasa.no/downloads/${_pkgname}-${pkgver}.tar.gz
+        # support for magnet links
+        # http://libtorrent.rakshasa.no/ticket/955 (deleted)
+        # http://libtorrent.rakshasa.no/ticket/2100
+        dht_pex_static_map.patch
+        magnet_uri.patch
+        # support for IPv6
+        # http://libtorrent.rakshasa.no/ticket/1111
+        ipv6.patch
+        # support for ipfilter.dat
+        # http://libtorrent.rakshasa.no/ticket/239
+        ip_filter_no_boost_fast.patch
+        # support for bad peers (kick/ban)
+        # http://ovh.ttdpatch.net/~jdrexler/rt/experimental/bad_peer_handling.diff
+        # https://calomel.org/rtorrent_mods.html
+        bad_peer_handling.patch
+        # support for colors
+        # http://libtorrent.rakshasa.no/ticket/1382
+        canvas_color.patch
+        # more infos at tracker list
+        trackerinfo.patch
+        # http://aur.archlinux.org/packages.php?ID=33756
+        vi_kb_akston.patch
+        # http://aur.archlinux.org/packages.php?ID=35642
+        vi_kb_tjwoosta.patch)
+md5sums=('b804c45c01c40312926bcea6b55bb084'
+         '795c2818d4d869f90f1b7734f94347fc'
+         '8dcd2c76ee2ed48e86707a2b94b34c34'
+         'cd9f4ce9202f6e03699b962f372a09e0'
+         '142f39586cd916608a7d569473bce1b0'
+         'e698da498f306435fb8f89824c47e0e8'
+         '8721dea9d4da9a4f11051de7a2490e40'
+         '1fc3b40153450f34f8f4c4e1a161b6b8'
+         '752590f272e48a2828a7e64746778df8'
+         'c5620714083fff8d609924c6bdb37fa0')
+
+build() {
+  cd "${srcdir}/${_pkgname}-${pkgver}"
+
+  patch -p1 < ${srcdir}/dht_pex_static_map.patch
+  patch -p1 < ${srcdir}/magnet_uri.patch
+  patch -p1 < ${srcdir}/ipv6.patch
+  patch -p1 < ${srcdir}/ip_filter_no_boost_fast.patch
+  patch -p1 < ${srcdir}/bad_peer_handling.patch
+  patch -p1 < ${srcdir}/canvas_color.patch
+  patch -p1 < ${srcdir}/trackerinfo.patch 
+
+  # disabled / enable only one of them
+  #patch -p1 < ${srcdir}/vi_kb_akston.patch
+  patch -p1 < ${srcdir}/vi_kb_tjwoosta.patch
+
+  ./autogen.sh 
+  CXXFLAGS="${CXXFLAGS} -fno-strict-aliasing" \
+  ./configure --prefix=/usr --disable-debug --enable-ipv6 --with-xmlrpc-c || return 1
+  make || return 1
+  make DESTDIR="${pkgdir}" install
+}
+# vim:set ts=2 sw=2 et:

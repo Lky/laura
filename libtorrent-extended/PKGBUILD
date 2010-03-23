@@ -1,0 +1,54 @@
+# Maintainer:  Lucky <aur.archlinux.org [at] lucky.take0ver [dot] net>
+# Contributor: Daenyth <Daenyth+Arch [at] gmail [dot] com>
+# Contributor: Jeff Mickey <jeff@archlinux.org>
+# Contributor: sh__
+
+pkgname=libtorrent-extended
+_pkgname=libtorrent
+pkgver=0.12.6
+pkgrel=3
+pkgdesc="BitTorrent library written in C++ with magnet link, IPv6 and bad peer patch"
+url="http://libtorrent.rakshasa.no"
+arch=('i686' 'x86_64')
+license=('GPL')
+depends=('libsigc++2.0' 'openssl')
+conflicts=('libtorrent')
+provides=('libtorrent')
+options=('!libtool')
+source=(http://libtorrent.rakshasa.no/downloads/${_pkgname}-${pkgver}.tar.gz
+        # support for magnet links
+        # http://libtorrent.rakshasa.no/ticket/955 (deleted)
+        # http://libtorrent.rakshasa.no/ticket/2100
+        dht_pex_static_map.patch
+        magnet_uri.patch
+        object_sstr.patch
+        # support for IPv6
+        # http://libtorrent.rakshasa.no/ticket/1111
+        ipv6.patch
+        # support for bad peers (kick/ban)
+        # http://ovh.ttdpatch.net/~jdrexler/rt/experimental/bad_peer_handling.diff
+        # https://calomel.org/rtorrent_mods.html
+        bad_peer_handling.patch)
+md5sums=('037499ed708aaf72988cee60e5a8d96b'
+         'c8c538e26e77a0cf5951c47b86252922'
+         'b1d9701ca0b8c26291c467e20d6e3eba'
+         '0eb6044530c1bb5bb21d5d539481c23d'
+         '90c5e5a374ee29737a0ad0a93c912e6a'
+         'b01ebff539102c07a0192e179c3170b1')
+
+build() {
+  cd "${srcdir}/${_pkgname}-${pkgver}"
+
+  patch -p1 < ${srcdir}/dht_pex_static_map.patch
+  patch -p1 < ${srcdir}/magnet_uri.patch
+  patch -p1 < ${srcdir}/object_sstr.patch
+  patch -p1 < ${srcdir}/ipv6.patch
+  patch -p1 < ${srcdir}/bad_peer_handling.patch
+  
+  ./autogen.sh
+  CXXFLAGS="${CXXFLAGS} -fno-strict-aliasing" \
+  ./configure --prefix=/usr --enable-ipv6 --disable-debug || return 1
+  make || return 1
+  make DESTDIR="${pkgdir}" install
+}
+# vim:set ts=2 sw=2 et:

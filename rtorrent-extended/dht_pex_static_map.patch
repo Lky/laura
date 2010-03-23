@@ -1,0 +1,12 @@
+diff --git a/src/core/view.cc b/src/core/view.cc
+index 8e2d997..f3b4f0d 100644
+--- a/src/core/view.cc
++++ b/src/core/view.cc
+@@ -90,6 +90,7 @@ struct view_downloads_filter : std::unary_function<Download*, bool> {
+       case torrent::Object::TYPE_STRING: return !result.as_string().empty();
+       case torrent::Object::TYPE_LIST:   return !result.as_list().empty();
+       case torrent::Object::TYPE_MAP:    return !result.as_map().empty();
++      case torrent::Object::TYPE_SSTRING:return !result.as_sstring().empty();
+       }
+ 
+       // The default filter action is to return true, to not filter

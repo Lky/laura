@@ -1,0 +1,233 @@
+diff --git a/src/dht/dht_node.cc b/src/dht/dht_node.cc
+index 3574807..9d51a28 100644
+--- a/src/dht/dht_node.cc
++++ b/src/dht/dht_node.cc
+@@ -59,8 +59,8 @@ DhtNode::DhtNode(const HashString& id, const rak::socket_address* sa) :
+     throw resource_error("Address not af_inet");
+ }
+ 
+-DhtNode::DhtNode(const std::string& id, const Object& cache) :
+-  HashString(*HashString::cast_from(id.c_str())),
++DhtNode::DhtNode(const SimpleString& id, const Object& cache) :
++  HashString(*HashString::cast_from(id)),
+   m_recentlyActive(false),
+   m_recentlyInactive(0),
+   m_bucket(NULL) {
+diff --git a/src/dht/dht_node.h b/src/dht/dht_node.h
+index 032c5cc..8234add 100644
+--- a/src/dht/dht_node.h
++++ b/src/dht/dht_node.h
+@@ -57,7 +57,7 @@ public:
+   static const unsigned int max_failed_replies = 5;
+ 
+   DhtNode(const HashString& id, const rak::socket_address* sa);
+-  DhtNode(const std::string& id, const Object& cache);
++  DhtNode(const SimpleString& id, const Object& cache);
+ 
+   const HashString&           id() const                 { return *this; }
+   const rak::socket_address*  address() const            { return &m_socketAddress; }
+diff --git a/src/dht/dht_router.cc b/src/dht/dht_router.cc
+index ff38b8c..e9abe5d 100644
+--- a/src/dht/dht_router.cc
++++ b/src/dht/dht_router.cc
+@@ -337,7 +337,7 @@ DhtRouter::store_cache(Object* container) const {
+   Object& nodes = container->insert_key("nodes", Object::create_map());
+   for (DhtNodeList::const_accessor itr = m_nodes.begin(); itr != m_nodes.end(); ++itr) {
+     if (!itr.node()->is_bad())
+-      itr.node()->store_cache(&nodes.insert_key(itr.id().str(), Object::create_map()));
++      itr.node()->store_cache(&nodes.insert_key(itr.id().s_str(), Object::create_map()));
+   }
+ 
+   // Insert contacts, if we have any.
+diff --git a/src/torrent/object.cc b/src/torrent/object.cc
+index 3a0bcae..b609f9c 100644
+--- a/src/torrent/object.cc
++++ b/src/torrent/object.cc
+@@ -44,47 +44,59 @@
+ 
+ namespace torrent {
+ 
+-Object&
+-Object::get_key(const std::string& k) {
+-  check_throw(TYPE_MAP);
+-  map_type::iterator itr = m_map->find(k);
++std::pair<Object::map_type::base_type::iterator, bool>
++Object::map_type::insert(const value_type& value) {
++  base_type::iterator itr = lower_bound(value.first);
+ 
+-  if (itr == m_map->end())
+-    throw bencode_error("Object operator [" + k + "] could not find element");
++  if (itr != end() && !key_comp()(value.first, itr->first))
++    return std::make_pair(itr, false);
+ 
+-  return itr->second;
+-}
++  // Insert with an allocated copy of the key.
++  itr = base_type::insert(itr, value_type(value.first.copy(), value.second));
+ 
++  // This means the value was actually already present.
++  if (itr->second.get_string() != NULL)
++    throw internal_error("Object::map_type::insert failed to insert value.");
+ 
+-const Object&
+-Object::get_key(const std::string& k) const {
+-  check_throw(TYPE_MAP);
+-  map_type::const_iterator itr = m_map->find(k);
++  // Make entry own the string and free it when erased.
++  itr->second.set_string(itr->first.c_str());
+ 
+-  if (itr == m_map->end())
+-    throw bencode_error("Object operator [" + k + "] could not find element");
++  return std::make_pair(itr, true);
++}
+ 
+-  return itr->second;
++Object::map_type::base_type::iterator
++Object::map_type::insert(base_type::iterator itr, const value_type& value) {
++  SimpleString copy = value.first.copy();
++  itr = base_type::insert(itr, value_type(copy, value.second));
++
++  // If the entry already owns its string, it wasn't really
++  // inserted and already existed, so discard the copy.
++  if (itr->second.get_string() != NULL)
++    delete [] copy.c_str();
++  else
++    itr->second.set_string(itr->first.c_str());
++
++  return itr;
+ }
+ 
+ Object&
+-Object::get_key(const char* k) {
++Object::get_key(const key_type& k) {
+   check_throw(TYPE_MAP);
+-  map_type::iterator itr = m_map->find(std::string(k));
++  map_type::iterator itr = m_map->find(k);
+ 
+   if (itr == m_map->end())
+-    throw bencode_error("Object operator [" + std::string(k) + "] could not find element");
++    throw bencode_error("Object operator [" + k.str() + "] could not find element");
+ 
+   return itr->second;
+ }
+ 
+ const Object&
+-Object::get_key(const char* k) const {
++Object::get_key(const key_type& k) const {
+   check_throw(TYPE_MAP);
+-  map_type::iterator itr = m_map->find(std::string(k));
++  map_type::iterator itr = m_map->find(k);
+ 
+   if (itr == m_map->end())
+-    throw bencode_error("Object operator [" + std::string(k) + "] could not find element");
++    throw bencode_error("Object operator [" + k.str() + "] could not find element");
+ 
+   return itr->second;
+ }
+@@ -143,7 +155,7 @@ Object::merge_copy(const Object& object, uint32_t maxDepth) {
+     while (srcItr != srcLast) {
+       destItr = std::find_if(destItr, dest.end(), rak::less_equal(srcItr->first, rak::mem_ref(&map_type::value_type::first)));
+ 
+-      if (srcItr->first < destItr->first)
++      if (dest.key_comp()(srcItr->first, destItr->first))
+         // destItr remains valid and pointing to the next possible
+         // position.
+         dest.insert(destItr, *srcItr);
+diff --git a/src/torrent/object.h b/src/torrent/object.h
+index 6cc4e4a..b7b4e8f 100644
+--- a/src/torrent/object.h
++++ b/src/torrent/object.h
+@@ -46,18 +46,52 @@
+ 
+ namespace torrent {
+ 
+-// TODO: Look into making a custom comp and allocator classes for the
+-// map_type which use a const char* for key_type.
+-//
+ // TODO: Use placement new/delete in order to avoid the extra level of
+ // indirection caused by the union.
+ 
+ class LIBTORRENT_EXPORT Object {
++  template<typename T>
++  class string_wrapper : public T {
++  public:
++    string_wrapper()                            : T(),      m_string(NULL) {}
++    string_wrapper(const T& value)              : T(value), m_string(NULL) {}
++    string_wrapper(const string_wrapper& other) : T(other), m_string(NULL) {}
++
++    ~string_wrapper() { delete [] m_string; m_string = NULL; }
++
++    const char* get_string() const         { return m_string; }
++    void        set_string(const char* s)  { m_string = s; }
++
++  private:
++    string_wrapper& operator = (const string_wrapper& other);
++
++    const char*  m_string;
++  };
++
+ public:
+   typedef int64_t                           value_type;
+   typedef std::string                       string_type;
+   typedef std::list<Object>                 list_type;
+-  typedef std::map<std::string, Object>     map_type;
++  class map_type : public std::map<SimpleString, string_wrapper<Object> > {
++  public:
++    typedef std::map<SimpleString, string_wrapper<Object> > base_type;
++    using base_type::value_type;
++    using base_type::key_type;
++
++    map_type(const map_type& other) : base_type(other.key_comp()) { insert(other.begin(), other.end()); }
++    map_type() {}
++
++    std::pair<base_type::iterator, bool> insert(const value_type& value);
++    base_type::iterator                  insert(base_type::iterator itr, const value_type& value);
++
++    template<typename InputIterator>
++    void                                 insert(InputIterator begin, InputIterator end);
++
++    Object& operator[] (key_type key);
++
++  private:
++    map_type& operator = (const map_type& other);
++  };
+   typedef map_type::key_type                key_type;
+ 
+   typedef list_type::iterator               list_iterator;
+@@ -153,8 +187,6 @@ public:
+ 
+   Object&             get_key(const key_type& k);
+   const Object&       get_key(const key_type& k) const;
+-  Object&             get_key(const char* k);
+-  const Object&       get_key(const char* k) const;
+ 
+   template <typename T> value_type&        get_key_value(const T& k)        { return get_key(k).as_value(); }
+   template <typename T> const value_type&  get_key_value(const T& k) const  { return get_key(k).as_value(); }
+@@ -213,6 +245,27 @@ public:
+   };
+ };
+ 
++// We need to call our own insert function, so
++// we have to define this operator to use that.
++inline Object&
++Object::map_type::operator[] (key_type key) {
++  base_type::iterator itr = lower_bound(key);
++
++  if (itr == end() || key_comp()(key, itr->first))
++    itr = insert(itr, value_type(key, mapped_type()));
++
++  return itr->second;
++}
++
++template<typename InputIterator>
++inline void
++Object::map_type::insert(InputIterator itr, InputIterator itrEnd) {
++  while (itr != itrEnd) {
++    insert(end(), *itr);
++    ++itr;
++  }
++}
++
+ inline
+ Object::Object(const Object& b) : m_flags(b.type()) {
+   switch (type()) {

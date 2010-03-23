@@ -1,0 +1,36 @@
+# Maintainer:  Lucky <aur.archlinux.org [at] lucky.take0ver [dot] net>
+# Contributor: Jonny Gerold <jonny@fsk141.com>
+
+pkgname=libtorrent-svn
+_pkgname=libtorrent
+pkgver=1151
+pkgrel=1
+pkgdesc="BitTorrent library written in C++"
+url="http://libtorrent.rakshasa.no"
+arch=('i686' 'x86_64')
+license=('GPL')
+depends=('libsigc++2.0' 'openssl')
+makedepends=('subversion' 'cppunit')
+conflicts=('libtorrent')
+provides=('libtorrent')
+source=()
+md5sums=()
+
+_svnmod="${_pkgname}"
+_svntrunk="svn://rakshasa.no/libtorrent/trunk/${_svnmod}"
+
+build() {
+  cd "${srcdir}"
+  msg "Connecting to ${_svnmod} SVN server..."
+  svn co ${_svntrunk} ${_svnmod} -r ${pkgver} 
+
+  msg "SVN checkout done or server timeout"
+  cd "${_svnmod}"
+  msg "Starting make..."
+
+  ./autogen.sh
+  CXXFLAGS="${CXXFLAGS} -fno-strict-aliasing" \
+  ./configure --prefix=/usr --disable-debug || return 1
+  make || return 1
+  make DESTDIR="${pkgdir}" install
+}
