@@ -3,7 +3,7 @@
 
 pkgname=libtorrent-svn
 _pkgname=libtorrent
-pkgver=1151
+pkgver=1164
 pkgrel=1
 pkgdesc="BitTorrent library written in C++"
 url="http://libtorrent.rakshasa.no"

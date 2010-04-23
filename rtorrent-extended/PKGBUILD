@@ -7,7 +7,7 @@
 pkgname=rtorrent-extended
 _pkgname=rtorrent
 pkgver=0.8.6
-pkgrel=3
+pkgrel=4
 pkgdesc="Ncurses BitTorrent client based on libTorrent with magnet link, IPv6, ipfilter, bad peers, color and trackerinfo patch."
 arch=('i686' 'x86_64')
 url="http://libtorrent.rakshasa.no"
@@ -35,6 +35,9 @@ source=(http://libtorrent.rakshasa.no/downloads/${_pkgname}-${pkgver}.tar.gz
         # support for colors
         # http://libtorrent.rakshasa.no/ticket/1382
         canvas_color.patch
+        # karabaja mod patchset (color, interface)
+        # http://aur.archlinux.org/packages.php?ID=36604
+        karabaja_mod.patch
         # more infos at tracker list
         trackerinfo.patch
         # http://aur.archlinux.org/packages.php?ID=33756
@@ -48,6 +51,7 @@ md5sums=('b804c45c01c40312926bcea6b55bb084'
          '142f39586cd916608a7d569473bce1b0'
          'e698da498f306435fb8f89824c47e0e8'
          '8721dea9d4da9a4f11051de7a2490e40'
+         'fdcee74cc8dc4abb1a5b627ae00b8345'
          '1fc3b40153450f34f8f4c4e1a161b6b8'
          '752590f272e48a2828a7e64746778df8'
          'c5620714083fff8d609924c6bdb37fa0')
@@ -55,21 +59,63 @@ md5sums=('b804c45c01c40312926bcea6b55bb084'
 build() {
   cd "${srcdir}/${_pkgname}-${pkgver}"
 
-  patch -p1 < ${srcdir}/dht_pex_static_map.patch
-  patch -p1 < ${srcdir}/magnet_uri.patch
-  patch -p1 < ${srcdir}/ipv6.patch
-  patch -p1 < ${srcdir}/ip_filter_no_boost_fast.patch
-  patch -p1 < ${srcdir}/bad_peer_handling.patch
-  patch -p1 < ${srcdir}/canvas_color.patch
-  patch -p1 < ${srcdir}/trackerinfo.patch 
+  echo -e "\e[1;32m===> \e[0m Do you want magentlink patch? [Y/n]"
+  echo -e "\e[1;31m===> \e[0m !!! needed by ipv6 patch !!!"
+  read _answer_ml
+  if [[ ! ${_answer_ml} = [n,N] ]]; then
+    patch -p1 < ${srcdir}/dht_pex_static_map.patch
+    patch -p1 < ${srcdir}/magnet_uri.patch
+  fi
+  echo -e "\e[1;32m===> \e[0m Do you want ipv6 patch? [y/N]"
+  echo -e "\e[1;33m===> \e[0m !!! scgi/xmlrpc-c won't work with this patch !!!"
+  read _answer_ipv6
+  if [[ ${_answer_ipv6} = [y,Y] ]]; then
+    patch -p1 < ${srcdir}/ipv6.patch
+    _option_ipv6="--enable-ipv6"
+  fi
+  echo -e "\e[1;32m===> \e[0m Do you want ipfilter patch? [Y/n]"
+  read _answer_ipf
+  if [[ ! ${_answer_ipf} = [n,N] ]]; then
+    patch -p1 < ${srcdir}/ip_filter_no_boost_fast.patch
+  fi
+  echo -e "\e[1;32m===> \e[0m Do you want bad peer handling patch? [Y/n]"
+  read _answer_bph
+  if [[ ! ${_answer_bph} = [n,N] ]]; then
+    patch -p1 < ${srcdir}/bad_peer_handling.patch
+  fi
+  echo -e "\e[1;32m===> \e[0m Do you want color/mod patch? [1/2/n]"
+  echo -e "\e[1;33m===> \e[0m 1) karabaja mod (default)"
+  echo -e "\e[1;33m===> \e[0m 2) canvas color"
+  read _answer_cc
+  if [[ ! ${_answer_cc} = [n,N] ]]; then
+    if [[ ! ${_answer_cc} = [2] ]]; then
+      patch -p1 < ${srcdir}/karabaja_mod.patch
+    else
+      patch -p1 < ${srcdir}/canvas_color.patch
+    fi
+  fi
+  echo -e "\e[1;32m===> \e[0m Do you want tracker info patch? [Y/n]"
+  read _answer_ti
+  if [[ ! ${_answer_ti} = [n,N] ]]; then
+    patch -p1 < ${srcdir}/trackerinfo.patch 
+  fi
+  echo -e "\e[1;32m===> \e[0m Do you want keybindings patch? [1/2/n]"
+  echo -e "\e[1;33m===> \e[0m 1) vi_kb_tjwoosta (default)"
+  echo -e "\e[1;33m===> \e[0m 2) vi_kb_akston"
+  read _answer_kb
+  if [[ ! ${_answer_kb} = [n,N] ]]; then
+    if [[ ! ${_answer_kb} = [2] ]]; then
+      patch -p1 < ${srcdir}/vi_kb_tjwoosta.patch
+    else
+      patch -p1 < ${srcdir}/vi_kb_akston.patch
+    fi
+  fi
 
-  # disabled / enable only one of them
-  #patch -p1 < ${srcdir}/vi_kb_akston.patch
-  patch -p1 < ${srcdir}/vi_kb_tjwoosta.patch
+  sed -i 's/rTorrent \" VERSION/rTorrent-eXtended " VERSION/' src/ui/download_list.cc
 
   ./autogen.sh 
   CXXFLAGS="${CXXFLAGS} -fno-strict-aliasing" \
-  ./configure --prefix=/usr --disable-debug --enable-ipv6 --with-xmlrpc-c || return 1
+  ./configure --prefix=/usr --disable-debug ${_option_ipv6} --with-xmlrpc-c || return 1
   make || return 1
   make DESTDIR="${pkgdir}" install
 }

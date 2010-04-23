@@ -3,13 +3,13 @@
 
 pkgname=rtorrent-svn
 _pkgname=rtorrent
-pkgver=1151
+pkgver=1164
 pkgrel=1
 pkgdesc="Ncurses BitTorrent client based on libTorrent"
 url="http://libtorrent.rakshasa.no"
 arch=('i686' 'x86_64')
 license=('GPL')
-depends=('libtorrent-svn>=1150' 'curl' 'xmlrpc-c')
+depends=('libtorrent-svn>=1153' 'curl' 'xmlrpc-c-svn>=1894')
 makedepends=('subversion' 'cppunit')
 conflicts=('rtorrent')
 provides=('rtorrent')
