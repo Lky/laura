@@ -1,0 +1,16 @@
+########################################
+# DO NOT EDIT THIS LINE:
+source /etc/mkinitcpio.d/kernel26-openvz.kver
+########################################
+ALL_config="/etc/mkinitcpio.conf"
+
+PRESETS=('default')
+#PRESETS=('default' 'fallback')
+
+#default_config="/etc/mkinitcpio.conf"
+default_image="/boot/kernel26-openvz.img"
+#default_options=""
+
+#fallback_config="/etc/mkinitcpio.conf"
+#fallback_image="/boot/kernel26-openvz-fallback.img" 
+#fallback_options="-S autodetect"

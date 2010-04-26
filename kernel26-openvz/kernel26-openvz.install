@@ -1,0 +1,41 @@
+KERNEL_NAME=-openvz
+KERNEL_VERSION=2.6.32.11-atkov.1-openvz
+
+post_install () {
+	echo ">>> Updating module dependencies. Please wait ..."
+	depmod ${KERNEL_VERSION}
+	echo ">>"
+	echo ">>> Generating initramfs, using mkinitcpio.  Please wait..."
+	echo ">>"
+  /sbin/mkinitcpio -p kernel26${KERNEL_NAME}
+
+	echo ">>> Note, what kernel-related packages such as ndiswrapper"
+	echo ">>> must be rebuilt for this custom kernel to work properly"
+	echo ">>"
+	echo ">>> You also must add this new kernel in boot loader config"
+	
+	echo ">>> Example for grub:"
+	cat <<GRUB
+title Arch Linux OpenVZ
+	root   (hd0,0)
+	kernel /vmlinuz26-openvz root=/dev/sda1 ro
+	initrd /kernel26-openvz.img
+GRUB
+	
+	echo ">>> Example for LILO:"
+	cat <<LILO
+image=/boot/vmlinuz26-openvz
+	label=arch-openvz
+	root=/dev/sda1
+	initrd=/boot/kernel26-openvz.img
+	read-only
+LILO
+}
+
+post_upgrade() {
+  post_install
+}
+
+op=$1
+shift
+$op $*
